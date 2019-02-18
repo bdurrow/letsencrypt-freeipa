@@ -41,41 +41,59 @@ interactive="${interactive:-true}"
 
 if ${interactive} ; then
     while ! [[ "${REPLY:-}" =~ ^[NnYy]$ ]]; do
-	read -rp "Please confirm you want to download and install letsencrypt FreeIPA scripts (y/n):" -n 1
-	echo
+	  read -rp "Please confirm you want to download and install letsencrypt FreeIPA scripts (y/n):" -n 1
+	  echo
     done
 else
     REPLY="y"
 fi
 
-if [[ ${REPLY} =~ ^[Yy]$ ]]; then
-    destination='/usr/sbin/renew_letsencrypt_cert.sh'
-    cronfile="/etc/cron.d/$(basename ${destination})"
-    export interactive
-    old_umask="$(umask)"
-    umask 0002
-    wget https://raw.githubusercontent.com/antevens/letsencrypt-freeipa/master/register.sh -O - | bash
-    wget https://raw.githubusercontent.com/antevens/letsencrypt-freeipa/master/renew.sh -O "${destination}"
-    chown root:root "${destination}"
-    chmod 0700 "${destination}"
-    umask "${old_umask}"
-    bash "${destination}"
-
-    echo  "Your system has been configured for using LetsEncrypt, adding a cronjob for renewals"
-
-    minute="${RANDOM}"
-    hour="${RANDOM}"
-    day="${RANDOM}"
-
-    let "minute %= 60"
-    let "hour %= 6"
-    let "day %= 28"
-    cronjob="${minute} ${hour} ${day} */2 ${destination}"
-
-    echo "Adding Cronjob: ${cronjob} to ${cronfile}"
-    echo "${cronjob}" > "${cronfile}"
-
-else
+if [[ ! ${REPLY} =~ ^[Yy]$ ]]; then
     echo "Let's Encrypt FreeIPA installation cancelled by user"
     exit 1
 fi
+
+#Compute the absolute path of the source for this script
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
+destination='/usr/sbin/renew_letsencrypt_cert.sh'
+cronfile="/etc/cron.d/$(basename ${destination})"
+export interactive
+old_umask="$(umask)"
+umask 0002
+
+if [[ ${DIR}/register.sh ]]; then
+    echo "Found existing register.sh in the same directory as this script; using that..."
+    bash ${DIR}/register.sh
+else
+    wget https://raw.githubusercontent.com/antevens/letsencrypt-freeipa/master/register.sh -O - | bash
+fi
+
+if [[ ${DIR}/renew.sh ]]; then
+    echo "Found existing renew.sh in the same directory as this script; using that..."
+    cp ${DIR}/renew.sh ${destination}
+else
+    wget https://raw.githubusercontent.com/antevens/letsencrypt-freeipa/master/renew.sh -O "${destination}"
+fi
+
+chown root:root "${destination}"
+chmod 0700 "${destination}"
+umask "${old_umask}"
+bash "${destination}"
+
+echo  "Your system has been configured for using LetsEncrypt, adding a cronjob for renewals"
+
+#certbot maintainers suggest attempting to renew every 12 hours
+#https://community.letsencrypt.org/t/cerbot-cron-job/23895/4
+(( minute %= 60 ))
+(( hour %= 12 ))
+cronjob="${minute}  ${hour}/12    * * * root ${destination} > /dev/null"
+
+echo "Adding Cronjob: ${cronjob} to ${cronfile}"
+echo "${cronjob}" > "${cronfile}"
