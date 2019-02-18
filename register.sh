@@ -85,39 +85,74 @@ else
     REPLY="y"
 fi
 
-if [[ ${REPLY} =~ ^[Yy]$ ]]; then
-    load_config '/etc/ipa/default.conf' realm
-    host="$(hostname)"
-    group='admins'
-    principals="$(ipa host-show ${host} --raw | grep krbprincipalname | grep 'host/' | sed 's.krbprincipalname: host/..' | sed s/@${realm}//)"
-
-    wget https://letsencrypt.org/certs/isrgrootx1.pem | sudo ipa-cacert-manage install isrgrootx1.pem -n ISRGRootCAX1 -t C,,
-    wget https://letsencrypt.org/certs/letsencryptauthorityx3.pem | sudo ipa-cacert-manage install letsencryptauthorityx3.pem -n ISRGRootCAX3 -t C,,
-    if [ "${EUID}" -ne 0 ] && ${interactive} ; then
-        sudo bash -c "export KRB5CCNAME='${KRB5CCNAME:-}' && ipa-certupdate -v"
-    else
-        ipa-certupdate
-    fi
-
-    sudo yum -y install certbot || sudo apt-get -y install certbot
-    ipa service-add "lets-encrypt/${host}@${realm}"
-    ipa role-add "DNS Administrator"
-    ipa role-add-privilege "DNS Administrator" --privileges="DNS Administrators"
-    ipa role-add-member "DNS Administrator" --services="lets-encrypt/${host}@${realm}"
-    ipa service-allow-create-keytab "lets-encrypt/${host}@${realm}" --groups=${group}
-    ipa service-allow-retrieve-keytab "lets-encrypt/${host}@${realm}" --groups=${group}
-    ipa-getkeytab -p "lets-encrypt/${host}" -k /etc/lets-encrypt.keytab #add -r to renew
-
-    for principal in ${principals} ; do
-        zone="$(echo "${principal}" | sed -e 's/^[a-zA-Z0-9\-\_]*\.//')"
-        ipa dnsrecord-add "${zone}." "_acme-challenge.${principal}." --txt-rec='INITIALIZED'
-    done
-
-    # Apply for the initial certificate if script is available
-    if [ -f "$(dirname ${0})/renew.sh" ] ; then
-        sudo bash -c "$(dirname ${0})/renew.sh"
-    fi
-else
-    echo "Let's Encrypt registration cancelled by user"
+if [[ ! ${REPLY} =~ ^[Yy]$ ]]; then
+    echo "Let's Encrypt FreeIPA registration cancelled by user"
     exit 1
+fi
+
+if [[ -n "${IPA_CONFIG_FILE:-}" ]]; then
+  #Skip setup because IPA_CONFIG_FILE is already set
+  cd . #NO-OP, do nothing
+elif [[ -e "/etc/ipa/server.conf" ]]; then
+  IPA_CONFIG_FILE="/etc/ipa/server.conf"
+elif [[ -e "/etc/ipa/default.conf" ]]; then
+  IPA_CONFIG_FILE="/etc/ipa/default.conf"
+else
+  errcho "FATAL: No ipa config found; exiting!!!"
+  exit 1
+fi
+
+load_config ${IPA_CONFIG_FILE} realm domain
+
+#I am not sure if this is the desired logic but
+#sometimes the hosting platform mangles the hostname
+#such that the domain name is provided by the platform
+#instead of my intended hostname
+if [[ -n ${domain} ]]; then
+  host="$(hostname -s).${domain}"
+else
+  host="$(hostname --fqdn)"
+fi
+
+group='admins'
+principals="$(ipa host-show ${host} --raw | sed --quiet --expression 's/^[[:space:]]*krbprincipalname:[[:space:]]*host\/\(.*\)@'${realm}'[[:space:]]*$/\1/p')"
+
+
+wget https://letsencrypt.org/certs/isrgrootx1.pem | sudo ipa-cacert-manage install isrgrootx1.pem -n ISRGRootCAX1 -t C,,
+wget https://letsencrypt.org/certs/letsencryptauthorityx3.pem | sudo ipa-cacert-manage install letsencryptauthorityx3.pem -n ISRGRootCAX3 -t C,,
+if [ "${EUID}" -ne 0 ] && ${interactive} ; then
+    sudo -E bash -c "export KRB5CCNAME='${KRB5CCNAME:-}' && ipa-certupdate -v"
+else
+    ipa-certupdate
+fi
+
+if [[ ! -x $(which certbot) ]]; then
+  sudo yum -y install certbot || sudo apt-get -y install certbot
+fi
+
+ipa service-add "lets-encrypt/${host}@${realm}"
+ipa role-add "DNS Administrator"
+ipa role-add-privilege "DNS Administrator" --privileges="DNS Administrators"
+ipa role-add-member "DNS Administrator" --services="lets-encrypt/${host}@${realm}"
+ipa service-allow-create-keytab "lets-encrypt/${host}@${realm}" --groups=${group}
+ipa service-allow-retrieve-keytab "lets-encrypt/${host}@${realm}" --groups=${group}
+
+getkeytab_command="ipa-getkeytab -p "lets-encrypt/${host}" -k /etc/lets-encrypt.keytab" #add -r to renew
+if [[ -e /etc/lets-encrypt.keytab ]]; then
+    echo "/etc/lets-encrypt.keytab already exists; skipping retrieval..."
+elif [ "${EUID}" -ne 0 ] && ${interactive} ; then
+    sudo -E bash -c "${getkeytab_command}"
+else
+    bash -c "${getkeytab_command}"
+fi
+
+for principal in ${principals} ; do
+    ipa dnsrecord-add "${domain}." "_acme-challenge.${principal}." --txt-rec='INITIALIZED'
+done
+
+# Apply for the initial certificate if script is available
+if [ -f "$(dirname ${0})/renew.sh" ] ; then
+    sudo bash -c "$(dirname ${0})/renew.sh"
+else
+    echo "Could not find location renew.sh; please run it manually."
 fi
